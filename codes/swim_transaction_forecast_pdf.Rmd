@@ -1,0 +1,672 @@
+---
+title: "Forecast ticket sales for outdoor swimming pools"
+author: "Zsombor Hegedus"
+date: '2021 february 14 '
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries, include=FALSE, cache = FALSE}
+#########################################################################################
+# Prepared for Gabor's Data Analysis
+#
+# Data Analysis for Business, Economics, and Policy
+# by Gabor Bekes and  Gabor Kezdi
+# Cambridge University Press 2021
+#
+# gabors-data-analysis.com 
+#
+# License: Free to share, modify and use for educational purposes. 
+# 	Not to be used for commercial purposes.
+
+# Modified to cater for task at hand by Zsombor Hegedus
+
+# CHAPTER 18
+# CH18 Forecasting daily ticket sales for a swimming pool 
+# using swim data
+# version 0.9 2020-08-31
+#########################################################################################
+
+# Clear memory -------------------------------------------------------
+rm(list=ls())
+
+# Import libraries ---------------------------------------------------
+library(ranger)
+library(xgboost)
+library(tidyverse)
+library(stargazer)
+library(Hmisc)
+library(timeDate)
+library(lubridate)
+library(caret)
+library(prophet)
+library(viridis)
+library(cowplot)
+```
+
+```{r all_code, include=FALSE, cache = TRUE}
+
+#####################################
+# Creating time features  ----------
+#####################################
+data_in <- 'C:/Users/T450s/Desktop/programming/git/forecast_ticket_volume/'
+
+#import data
+daily_agg<-read.csv(file = paste(data_in,"data/swim_work.csv",sep="")) %>% 
+  mutate(date = as.Date(date))
+
+# dow: 1=Monday, weekend: Sat and Sun.
+daily_agg <- daily_agg %>%
+  mutate(year = year(date),
+         quarter = quarter(date),
+         month = factor(month(date)),
+         day = day(date)) %>%
+  mutate(dow = factor(lubridate::wday(date, week_start = getOption("lubridate.week.start", 1)))) %>%
+  mutate(weekend = factor(as.integer(dow %in% c(6,7))))
+
+
+
+daily_agg <- daily_agg %>% 
+  mutate(school_off = ((day>15 & month==5 & day <=30) | (month==6 |  month==7) |
+                         (day<15 & month==8) | (day>20 & month==12) ))
+
+daily_agg <- daily_agg %>% 
+  mutate(trend = c(1:dim(daily_agg)[1]))
+
+# Get holiday calendar ----------------------------------
+
+holidays <-  as.Date(holidayNYSE(2010:2017))
+  
+daily_agg <- daily_agg %>% 
+  mutate(isHoliday = ifelse(date %in% holidays,1,0))
+
+# Define vars for analysis ----------------------------------
+
+daily_agg <- 
+  daily_agg %>% 
+  group_by(month) %>% 
+  mutate(q_month = mean(QUANTITY)) %>% 
+  ungroup()
+
+daily_agg <- daily_agg %>% 
+  mutate(QUANTITY2 = ifelse(QUANTITY<1, 1, QUANTITY)) %>% 
+  mutate(q_ln = log(QUANTITY2))
+
+daily_agg <- 
+  daily_agg %>% 
+  group_by(month, dow) %>% 
+  mutate(tickets = mean(QUANTITY),
+         tickets_ln = mean(q_ln)) %>% 
+  ungroup()
+
+# named date vars for graphs
+mydays <- c("Mon","Tue","Wed",
+            "Thu","Fri","Sat",
+            "Sun")
+daily_agg$dow_abb   <-factor(   mydays[daily_agg$dow],  levels=mydays)
+daily_agg$month_abb <-factor(month.abb[daily_agg$month],levels=month.abb)
+
+# get first and second deltas 
+
+daily_agg <- 
+    daily_agg %>% mutate(
+    d1_q_ln  = q_ln/lag(q_ln,1) ,
+    d2_q_ln = q_ln/lag(q_ln,2),
+    d1_q_ln = ifelse(is.na(d1_q_ln) | is.infinite(d1_q_ln),0,d1_q_ln),
+    d2_q_ln = ifelse(is.na(d2_q_ln) | is.infinite(d2_q_ln),0,d2_q_ln)
+) 
+
+
+################################
+# Descriptive graphs ----------
+#################################
+
+
+g1 <-ggplot(data=daily_agg[daily_agg$year==2015,], aes(x=date, y=QUANTITY)) +
+  geom_line(size=0.4, color='navyblue') +
+  scale_x_date(breaks = as.Date(c("2015-01-01","2015-04-01","2015-07-01","2015-10-01","2016-01-01")),
+               labels = scales::date_format("%d%b%Y"),
+               date_minor_breaks = "1 month" ) +
+  labs( x = "Date (day)", y="Daily ticket sales" ) +
+  scale_color_discrete(name = "")+ theme_minimal()
+
+
+# seasonality is strong in the summer time, and there are interim spikes in within weeks as well
+
+g2<-ggplot(data=daily_agg[(daily_agg$year>=2010) & (daily_agg$year<=2014),], aes(x=date, y=QUANTITY)) +
+  geom_line(size=0.2, color='navyblue') +
+  theme_minimal() +
+  scale_x_date(breaks = as.Date(c("2010-01-01","2011-01-01","2012-01-01","2013-01-01","2014-01-01","2015-01-01")),
+               labels = scales::date_format("%d%b%Y"),
+               minor_breaks = "3 months") +
+  labs( x = "Date (day)", y="Daily ticket sales" ) +
+  scale_color_discrete(name = "")
+
+#spikes around summer time are consistent over the 5 years 
+
+
+g3<-ggplot(data=daily_agg, aes(x=month_abb, y=QUANTITY)) +
+  theme_minimal() +
+  labs( x = "Date (month)", y="Daily ticket sales" ) +
+  geom_boxplot(color='navyblue',outlier.color = 'black', outlier.alpha = 0.6, outlier.size = 0.4)
+
+
+g4<-ggplot(data=daily_agg, aes(x=dow_abb, y=QUANTITY)) +
+  theme_minimal() +
+  labs( x = "Day of the week", y="Daily ticket sales" ) +
+  geom_boxplot(color='navyblue',outlier.color = 'black', outlier.alpha = 0.6, outlier.size = 0.4)
+
+
+# to check for interactions, look at the heatmap
+swim_heatmap <- 
+  ggplot(daily_agg, aes(x = dow_abb, y = month_abb, fill = tickets)) +
+  geom_tile(colour = "white") +
+  labs(x = 'Day of the week', y = 'Month ') +
+  scale_fill_viridis(alpha = 0.7, begin = 1, end = 0.2, direction = 1, option = "D") +
+  theme_minimal() +
+  theme(legend.position = "right",
+    legend.text = element_text(size=6),
+    legend.title =element_text(size=6)
+    )
+
+
+#####################################
+# PREDICTION  ----------
+#####################################
+
+
+#############################
+# Create train/houldout data
+#############################
+
+# Last year of data
+data_holdout<- daily_agg %>%
+  filter(year==2016)
+
+# Rest of data for training
+data_train <- daily_agg %>%
+  filter(year<2016)
+
+# Prepare for cross-validation
+data_train <- data_train %>% 
+  rownames_to_column() %>% 
+  mutate(rowname = as.integer(rowname))
+
+test_index_list <- data_train %>% 
+  split(f = factor(data_train$year)) %>% 
+  lapply(FUN = function(x){x$rowname})
+
+train_index_list <- test_index_list %>% 
+  lapply(FUN = function(x){setdiff(data_train$rowname, x)})
+
+  
+train_control <- trainControl(
+  method = "cv",
+  index = train_index_list, #index of train data for each fold
+  # indexOut = index of test data for each fold, complement of index by default
+  # indexFinal = index of data to use to train final model, whole train data by default
+  savePredictions = TRUE
+)
+
+# Fit models ---------------------------------------------------------
+
+#Model 1 linear trend + monthly seasonality
+model1 <- as.formula(QUANTITY ~ 1 + trend + month)
+reg1 <- train(
+  model1,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+#Model 2 linear trend + monthly seasonality + days of week seasonality 
+model2 <- as.formula(QUANTITY ~ 1 + trend + month + dow)
+reg2 <- train(
+  model2,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+#Model 3 linear trend + monthly seasonality + days of week  seasonality + holidays 
+model3 <- as.formula(QUANTITY ~ 1 + trend + month + dow + isHoliday)
+reg3 <- train(
+  model3,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+
+#Model 4 linear trend + monthly seasonality + days of week  seasonality + holidays + sch*dow
+model4 <- as.formula(QUANTITY ~ 1 + trend + month + dow + isHoliday + school_off*dow)
+reg4 <- train(
+  model4,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+#Model 5 linear trend + monthly seasonality + days of week  seasonality + holidays + interactions
+model5 <- as.formula(QUANTITY ~ 1 + trend + month + dow + isHoliday + school_off*dow + weekend*month)
+reg5 <- train(
+  model5,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+#Model 6 linear trend + monthly seasonality + days of week  seasonality + holidays + interactions + deltas
+model6 <- as.formula(QUANTITY ~ 1 + trend + month + dow + isHoliday + school_off*dow + weekend*month + d1_q_ln + d2_q_ln)
+reg6 <- train(
+    model6,
+    method = "lm",
+    data = data_train,
+    trControl = train_control
+)
+
+
+#Model 7 =  multiplicative trend and seasonality (ie take logs, predict log values and transform back with correction term)
+model7 <- as.formula(q_ln ~ 1 + trend + month + dow + isHoliday + school_off*dow + d1_q_ln + d2_q_ln)
+reg7 <- train(
+  model7,
+  method = "lm",
+  data = data_train,
+  trControl = train_control
+)
+
+
+# Get CV RMSE ----------------------------------------------
+
+model_names <- c("reg1","reg2","reg3","reg4","reg5", 'reg6')
+rmse_CV <- c()
+
+for (i in model_names) {
+  rmse_CV[i]  <- get(i)$results$RMSE
+}
+
+#had to cheat and use train error on full train set because could not obtain CV fold train errors
+corrb <- mean((reg7$finalModel$residuals)^2)
+rmse_CV["reg7"] <- reg7$pred %>% 
+  mutate(pred = exp(pred  + corrb/2)) %>% 
+  group_by(Resample) %>% 
+  summarise(rmse = RMSE(pred, exp(obs))) %>% 
+  as.data.frame() %>% 
+  summarise(mean(rmse)) %>% 
+  as.numeric()
+
+# Use prophet prediction -------------------------------------------
+# add CV into prophet
+# can be done with prophet: https://facebook.github.io/prophet/docs/diagnostics.html
+# done but this is a different cross-validation as for the other models as it must be time-series like
+
+# prophet -  multiplicative option -- tried but produced much worse results (~34. RMSE)
+
+
+model_prophet <- prophet( fit=F, 
+                          seasonality.mode = "additive", 
+                          yearly.seasonality = "auto",
+                          weekly.seasonality = "auto",
+                          growth = "linear",
+                          daily.seasonality=TRUE)
+
+model_prophet <-  add_country_holidays(model_prophet, "US")
+model_prophet <- fit.prophet(model_prophet, df= data.frame(ds = data_train$date,
+                                                           y = data_train$QUANTITY ))
+
+cv_pred <- cross_validation(model_prophet, initial = 365, period = 365, horizon = 365, units = 'days')
+rmse_prophet_cv <- performance_metrics(cv_pred, rolling_window = 1)$rmse
+
+####
+# Random Forest
+####
+
+predictors <- c('trend', 'month', 'dow' ,'isHoliday', 'weekend', 'school_off' ,'d1_q_ln' ,'d2_q_ln')
+
+sqrt(length(predictors))
+
+
+tune_grid <- expand.grid(
+    .mtry = c( 4, 5),
+    .splitrule = "variance",
+    .min.node.size = c(3,4, 5)
+)
+
+set.seed(7)
+system.time({
+    rf_model <- train(
+        formula(paste0("QUANTITY ~", paste0(predictors, collapse = " + "))),
+        data = data_train,
+        method = "ranger",
+        trControl = train_control,
+        tuneGrid = tune_grid,
+        importance = "impurity"
+    )
+})
+
+
+####
+# XGBoost
+####
+
+gbm_grid <-  expand.grid(nrounds=c(350),
+                         max_depth = c(2,3, 4),
+                         eta = c(0.03,0.05, 0.06),
+                         gamma = c(0.01),
+                         colsample_bytree = c(0.5),
+                         subsample = c(0.75),
+                         min_child_weight = c(0))
+
+
+set.seed(7)
+xgb_model <- train(
+    formula(paste0("QUANTITY ~", paste0(predictors, collapse = " + "))),
+    method = "xgbTree",
+    #metric = 'NormalizedGini',
+    data = data_train,
+    tuneGrid = gbm_grid,
+    trControl = train_control
+)
+
+
+# Check model results
+
+models <- list(
+    'OLS1' = reg1, 
+    'OLS2' = reg2,
+    'OLS3' = reg3,
+    'OLS4' = reg4,
+    'OLS5' = reg5,
+    'OLS6' = reg6,
+    'Random Forest' = rf_model,
+    'XGBoost'= xgb_model)
+
+results <- resamples(models) %>%  summary()
+
+#Based on CV RMSEs Random forest is to be used 
+
+###########################x
+# Evaluate best model on holdout set --------------------------------------------
+###########################
+
+# Out of curiosity, checking RMSEs on holdout set 
+
+result_holdout <- map(models, ~{
+    RMSE(predict(.x, newdata = data_holdout), data_holdout[["QUANTITY"]])
+}) %>% unlist() %>% as.data.frame() %>%
+    rename("Holdout RMSE" = ".")
+
+# Best holdout RMSE: 
+
+data_holdout <- data_holdout %>% 
+  mutate(y_hat = predict(rf_model, newdata = .))
+
+###########################x
+# Plot best predictions --------------------------------------------
+###########################x
+
+#graph relative RMSE (on holdout) per month 
+rmse_monthly <- data_holdout %>% 
+  mutate(month = factor(format(date,"%b"), 
+                        levels= unique(format(sort(.$date),"%b")), 
+                        ordered=TRUE)) %>% 
+  group_by(month) %>% 
+  summarise(
+    RMSE = RMSE(QUANTITY, y_hat),
+    RMSE_norm= RMSE(QUANTITY, y_hat)/mean(QUANTITY)
+            ) 
+
+g_predictions_rmse<- ggplot(rmse_monthly, aes(x = month, y = RMSE_norm)) +
+  geom_col(bg='navyblue', color='navyblue') +
+  labs( x = "Date (month)", y="RMSE (normalized by monthly sales)" ) +
+    theme_minimal() 
+
+# predictions are relatively bad in Jan, May, Dec, but quite good in Jun, July
+
+g_predictions<-
+  ggplot(data=data_holdout, aes(x=date, y=QUANTITY)) +
+  geom_line(aes(size="Actual", colour="Actual", linetype = "Actual") ) +
+  geom_line(aes(y=y_hat, size="Predicted" ,colour="Predicted",  linetype= "Predicted")) +
+  scale_y_continuous(expand = c(0,0))+
+  scale_x_date(expand=c(0,0), breaks = as.Date(c("2016-01-01","2016-03-01","2016-05-01","2016-07-01","2016-09-01","2016-11-01", "2017-01-01")),
+               labels = scales::date_format("%d%b%Y"),
+               date_minor_breaks = "1 month" )+
+  scale_color_manual(values=c('navyblue','purple4'), name="")+
+  scale_size_manual(name="", values=c(0.4,0.7))+
+  #scale_linetype_manual(name = "", values=c("solid", "solid")) +
+  scale_linetype_manual(name = "", values=c("solid", "twodash")) +
+  labs( x = "Date (day)", y="Daily ticket sales" ) +
+  theme_minimal() +
+  #theme(legend.position = "none") +
+  #annotate("text", x = as.Date("2016-07-15"), y = 50, label = "Predicted", color=color[2], size=3)+
+  #annotate("text", x = as.Date("2016-09-01"), y = 125, label = "Actual", color=color[1], size=3)
+  theme(legend.position=c(0.7,0.8),
+      legend.direction = "horizontal",
+      legend.text = element_text(size = 6),
+      legend.key.width = unit(.8, "cm"),
+      legend.key.height = unit(.3, "cm")) + 
+  guides(linetype = guide_legend(override.aes = list(size = 0.8))
+         )
+
+
+# Preds for Dec
+g_predictions_dec <- ggplot(data=data_holdout %>% filter(month==12), aes(x=date, y=QUANTITY)) +
+  geom_line(aes(size="Actual", colour="Actual", linetype = "Actual") ) +
+  geom_line(aes(y=y_hat, size="Predicted" ,colour="Predicted",  linetype= "Predicted")) +
+  geom_ribbon(aes(ymin=QUANTITY,ymax=y_hat), fill='purple', alpha=0.3) +
+  #scale_y_continuous(expand = c(0.01,0.01), limits = c(0,150))+
+  scale_x_date(expand=c(0.01,0.01), breaks = as.Date(c("2016-12-01","2016-12-08","2016-12-15","2016-12-22","2016-12-29")),
+               limits = as.Date(c("2016-12-01","2016-12-31")),
+               labels = scales::date_format("%d%b")) +
+  scale_color_manual(values=c('navyblue','purple4'), name="")+
+  scale_size_manual(name="", values=c(0.4,0.7))+
+  #scale_linetype_manual(name = "", values=c("solid", "solid")) +
+  scale_linetype_manual(name = "", values=c("solid", "twodash")) +
+  labs( x = "Date (day)", y="Daily ticket sales" ) +
+  theme_minimal() +
+  #theme(legend.position = "none") +
+  #annotate("text", x = as.Date("2016-08-04"), y = 55, label = "Actual", color=color[2], size=2)+
+  #annotate("text", x = as.Date("2016-08-17"), y = 115, label = "Predicted", color=color[1], size=2)
+  theme(legend.position=c(0.7,0.8),
+        legend.direction = "horizontal",
+        legend.text = element_text(size = 4),
+        legend.key.width = unit(.8, "cm"),
+        legend.key.height = unit(.2, "cm")) + 
+  guides(linetype = guide_legend(override.aes = list(size = 0.6))
+  )
+
+
+g_predictions_may <- ggplot(data=data_holdout %>% filter(month==5), aes(x=date, y=QUANTITY)) +
+    geom_line(aes(size="Actual", colour="Actual", linetype = "Actual") ) +
+    geom_line(aes(y=y_hat, size="Predicted" ,colour="Predicted",  linetype= "Predicted")) +
+    geom_ribbon(aes(ymin=QUANTITY,ymax=y_hat), fill='purple', alpha=0.3) +
+    #scale_y_continuous(expand = c(0.01,0.01), limits = c(0,150))+
+    scale_x_date(expand=c(0.01,0.01), breaks = as.Date(c("2016-05-01","2016-05-08","2016-05-15","2016-05-22","2016-05-29")),
+                 limits = as.Date(c("2016-05-01","2016-05-31")),
+                 labels = scales::date_format("%d%b")) +
+    scale_color_manual(values=c('navyblue','purple4'), name="")+
+    scale_size_manual(name="", values=c(0.4,0.7))+
+    #scale_linetype_manual(name = "", values=c("solid", "solid")) +
+    scale_linetype_manual(name = "", values=c("solid", "twodash")) +
+    labs( x = "Date (day)", y="Daily ticket sales" ) +
+    theme_minimal() +
+    #theme(legend.position = "none") +
+    #annotate("text", x = as.Date("2016-08-04"), y = 55, label = "Actual", color=color[2], size=2)+
+    #annotate("text", x = as.Date("2016-08-17"), y = 115, label = "Predicted", color=color[1], size=2)
+    theme(legend.position=c(0.7,0.8),
+          legend.direction = "horizontal",
+          legend.text = element_text(size = 4),
+          legend.key.width = unit(.8, "cm"),
+          legend.key.height = unit(.2, "cm")) + 
+    guides(linetype = guide_legend(override.aes = list(size = 0.6))
+    )
+
+g_predictions_jun <- ggplot(data=data_holdout %>% filter(month==6), aes(x=date, y=QUANTITY)) +
+    geom_line(aes(size="Actual", colour="Actual", linetype = "Actual") ) +
+    geom_line(aes(y=y_hat, size="Predicted" ,colour="Predicted",  linetype= "Predicted")) +
+    geom_ribbon(aes(ymin=QUANTITY,ymax=y_hat), fill='purple', alpha=0.3) +
+    #scale_y_continuous(expand = c(0.01,0.01), limits = c(0,150))+
+    scale_x_date(expand=c(0.01,0.01), breaks = as.Date(c("2016-06-01","2016-06-08","2016-06-15","2016-06-22","2016-06-29")),
+                 limits = as.Date(c("2016-06-01","2016-06-31")),
+                 labels = scales::date_format("%d%b")) +
+    scale_color_manual(values=c('navyblue','purple4'), name="")+
+    scale_size_manual(name="", values=c(0.4,0.7))+
+    #scale_linetype_manual(name = "", values=c("solid", "solid")) +
+    scale_linetype_manual(name = "", values=c("solid", "twodash")) +
+    labs( x = "Date (day)", y="Daily ticket sales" ) +
+    theme_minimal() +
+    #theme(legend.position = "none") +
+    #annotate("text", x = as.Date("2016-08-04"), y = 55, label = "Actual", color=color[2], size=2)+
+    #annotate("text", x = as.Date("2016-08-17"), y = 115, label = "Predicted", color=color[1], size=2)
+    theme(legend.position=c(0.7,0.8),
+          legend.direction = "horizontal",
+          legend.text = element_text(size = 4),
+          legend.key.width = unit(.8, "cm"),
+          legend.key.height = unit(.2, "cm")) + 
+    guides(linetype = guide_legend(override.aes = list(size = 0.6))
+    )
+
+g_predictions_jul <- ggplot(data=data_holdout %>% filter(month==7), aes(x=date, y=QUANTITY)) +
+    geom_line(aes(size="Actual", colour="Actual", linetype = "Actual") ) +
+    geom_line(aes(y=y_hat, size="Predicted" ,colour="Predicted",  linetype= "Predicted")) +
+    geom_ribbon(aes(ymin=QUANTITY,ymax=y_hat), fill='purple', alpha=0.3) +
+    #scale_y_continuous(expand = c(0.01,0.01), limits = c(0,150))+
+    scale_x_date(expand=c(0.01,0.01), breaks = as.Date(c("2016-07-01","2016-07-08","2016-07-15","2016-07-22","2016-07-29")),
+                 limits = as.Date(c("2016-07-01","2016-07-31")),
+                 labels = scales::date_format("%d%b")) +
+    scale_color_manual(values=c('navyblue','purple4'), name="")+
+    scale_size_manual(name="", values=c(0.4,0.7))+
+    #scale_linetype_manual(name = "", values=c("solid", "solid")) +
+    scale_linetype_manual(name = "", values=c("solid", "twodash")) +
+    labs( x = "Date (day)", y="Daily ticket sales" ) +
+    theme_minimal() +
+    #theme(legend.position = "none") +
+    #annotate("text", x = as.Date("2016-08-04"), y = 55, label = "Actual", color=color[2], size=2)+
+    #annotate("text", x = as.Date("2016-08-17"), y = 115, label = "Predicted", color=color[1], size=2)
+    theme(legend.position=c(0.7,0.8),
+          legend.direction = "horizontal",
+          legend.text = element_text(size = 4),
+          legend.key.width = unit(.8, "cm"),
+          legend.key.height = unit(.2, "cm")) + 
+    guides(linetype = guide_legend(override.aes = list(size = 0.6))
+    )
+
+```
+
+## Executive summary
+
+The goal of this analysis is to carry out a 12 month forecast for how many tickets will be sold on given day for outdoor swimming pools. This paper uses 6 years of historic transactional data which is available on [Gabos Data Analysis site](https://osf.io/7epdj/). After trying out several OLS regressions with increasing complexity, I will employ two tree based models; a random forest and an XGBoost. For model evaluation my loss function was RMSE, and I used 5-fold cross validation for control within the time series data (for each fold I used one year of observations as test and train the models on the rest). Random forest was chosen as the final model which was used to forecast sales in 2016, that served the purpose of a holdout set. The model could be confidently used for sales prediction so that the owners of the swimming pool can plan ahead knowing how much they can expect to earn in a given year. 
+
+*Github:* For this assignment, due to size limitations, I only submitted the PDF file, but for every workfiles with all the codes needed to produce this document, please visit my [github repo](https://github.com/zsomborh/forecast_ticket_volume).
+
+## Data description, and feature engineering
+
+The dataset used is `swim-transactions` that contained transactional data for tickets sold for swimming pools in the city of Albuquerque between 2010 and 2016. First of all transactional data needed to be aggregated to daily frequency, and then gaps had to be filled (e.g. missing days when there were no tickets sold were inserted with 0 as quantity of tickets sold) so that I have a full gapless daily time-series data. I also filtered for outdoor swimming pools only, (those denoted with location that starts with *AQ* and ends with *01* ), and removed tickets sold for a few categories, such as swimming competition etc... so that I can focus on the business-as-usual activities. Figure 1 shows how daily sold ticket volumes looked like in the whole timeseries between 2010 and 2015 (2016 is left out intentionally as that will be the holdout set).  
+
+```{r, fig 1, fig.width=10,fig.height=3.2, fig.align='center', fig.cap='Time series of tickets sold between 2010 and 2016', echo = FALSE , results = "asis", warning = FALSE, message = FALSE}
+g2
+```
+\newpage
+Figure 1 illustrates very clearly that there is a strong seasonality and that much more tickets are sold for summer months. This is probabily due to the weather, but also, the schools close to these swimming pools are not open at that time, which turned out to be an important factor in the case study of the book. To get to the best possible predictions I introduced the following predictors:
+
+- Variables that leverage the time series properties such as factors for day of the week, factor for months, dummies for weekend and holidays, and also for days when the schools are closed. 
+- I further enriched my dataset with the 1st and 2nd $\Delta$ for the log of tickets sold. 
+- I also experimented with taking the log of ticket's sold as my outcome variable (given its skewed distribution) but it performed much worse than the other models, so I decided not to pursue that.
+
+To further highlight the purpose of a day of week variable and a weekend dummy, I included a heatmap in Figure 2. It can be seen that on the weekends the ticket sales are always higher, and that on Fridays there is lower frequency of sold tickets. From the heatmap one can also notice that swimming pools are much more visited in the summertime.
+
+```{r, fig 2, fig.width=10,fig.height=3.5, fig.align='center', fig.cap='Heatmap of tickets sold for days of the week for different month and boxplots for day of the week ticket sales', echo = FALSE , results = "asis", warning = FALSE, message = FALSE}
+plot_grid(swim_heatmap, g4)
+```
+
+## Modeling
+
+I started off with 6 simple OLS regression each incrementally more complex compared to the previous. For train control, I used 5 fold cross validation, in which I always stripped out one of the years to be a test set so that the remaining observations can be used to train the models. 2016 data was put aside to be a holdout set which will only be used once the final model for the forecast is chosen.
+
+For the first few cases, I just wanted to see if it makes sense to include the variables that I created and whether RMSE of the prediction on the training set will decrease. The first one uses the trend (an ordered number list that starts with 1 and increases by one for each day), and the month factor only. The second includes the day of the month, while the third also includes holidays. The fourth looks at an interaction between the schools being closed and the day of the week, while the fifth also uses and interaction between weekend and months. The last model looks at the first and second $\Delta$ of ticket's sold as well. Table 1 summarises the cross validated RMSEs of the above mentioned cases which clearly indicates that the models increase their predictive performance on the training set with the inclusion of more and more variables. It's interesting to see that the biggest improvement in RMSE terms is when the interaction terms are introduced in the regression - most importantly the *school_off* dummy, which takes up the value of 1, in case schools were closed on given date.
+
+```{r table 1, echo = FALSE , results = "asis", warning = FALSE, message = FALSE }
+knitr::kable(as.data.frame(t(results$statistics$RMSE[,'Mean']))[,1:6], caption= 'Comparing CV RMSE of OLS models with increasing complexity ', digits = c(4,4,4,4,4,4)) 
+```
+
+After seeing what OLS is capable of I experimented with a random forest and an XGBoost model, while also running Facebook's Prophet (Prophet had an RMSE of 101.8 that didn't come close to that of the other two tree based models, so I didn't pursue it further). All three managed to beat the OLS regression models, with the random forest and XGBoost performing on pair with each other. However I needed to choose one model in the end and I went with random forest given it had the lowest CV RMSE. Table 2 summarises the RMSEs both on the training and on the holdout set (and it looks like XGBoost would have done slightly better on the holdout, but model choice should not be impacted by holdout RMSEs). The Random Forest with it's 83,21 RMSE achieves an incredible almost 35% improvement on the fit compared to the simplest OLS, and still had almost 25% improvement when compared to the best OLS.  
+
+```{r table 2, echo = FALSE , results = "asis", warning = FALSE, message = FALSE }
+result_list = list()
+for (i in 1:length(results$models)) {
+    result_list[[results$models[i]]] <- results$statistics$RMSE[results$models[i],'Mean']
+}
+col1 <-names(result_list)
+col2  <- result_list %>% unlist
+summary_df <- cbind(col1,col2,result_holdout) %>% as.data.frame()
+
+colnames(summary_df) <- c('Models','CV RMSE', 'Holdout RMSE')
+
+knitr::kable(summary_df[c('OLS1', 'OLS6', 'Random Forest', 'XGBoost'),c('CV RMSE', 'Holdout RMSE')], caption= 'Comparing CV RMSE and holdout RMSE on OLS and tree based models', digits = c(4,4)) 
+
+```
+
+## Forecast 
+
+Forecast using the chosen model can be seen visually on Figure 3 alongside with a barplot with normalised RMSEs for all 12 months. 
+
+```{r, fig 3, fig.width=10,fig.height=4.8, fig.align='center', fig.cap='Forecasted and actual data for ticket sales in 2016 and normalised RMSEs for each month', echo = FALSE , results = "asis", warning = FALSE, message = FALSE}
+plot_grid(g_predictions, g_predictions_rmse, nrow=2)
+```
+\newpage
+It is visible that the prediction pretty much captured the seasonality and also had a relatively good performance for all months. When looking at each month in detail December, and May looks to be the worst, and Jun and July to be the best when it comes to normalised RMSEs. When taking a closer look at these months in Figure 4 it looks like the model consistently overpredicted in Dec and May whereas it consistently underpredicted for Jun and July. Understanding the dynamics behind these could be valuable for the business and could enhance the forecast by improving model assumptions.
+
+```{r, fig 4, fig.width=10,fig.height=6, fig.align='center', fig.cap='Forecasted and actual data for ticket sales in 4 handpicked months', echo = FALSE , results = "asis", warning = FALSE, message = FALSE}
+plot_grid(
+g_predictions_may,
+g_predictions_jun,
+g_predictions_jul,
+g_predictions_dec,nrow=2, ncol =2, labels = c( 'May', 'Jun', 'Jul', 'Dec'))
+```
+
+The variable importance plot in Figure 5 can show even more information as to what variable plays a pivotal role when the random forest forecasts. In this figure I summed up the importance of each factor variable and grouped them together. Months won by a large margin, which is understandable given the seasonality in the summer months, but the day of the week variable might come as a surpirse. I thought that just by seeing a different behaviour between weekdays and weekends the day of the week variable will be an important factor when splitting the nodes of the trees, but it doesn't seem to be this way. Another very interesting finding is that the *school_off* dummy was one of the most important variables to consider and it definitely makes sense to include such a variable in the models.
+
+```{r, fig 5, fig.width=6,fig.height=4, fig.align='center', fig.cap='Most important variables in the random forest model (month and dow factor variables are grouped)', echo = FALSE , results = "asis", warning = FALSE, message = FALSE}
+# variable importance data frame
+rf_model_var_imp <- importance(rf_model$finalModel)/1000
+rf_model_var_imp_df <-
+    data.frame(varname = names(rf_model_var_imp),imp = rf_model_var_imp) %>%
+    arrange(desc(imp)) %>%
+    mutate(imp_percentage = imp/sum(imp))
+rf_model_var_imp_df <- rf_model_var_imp_df
+# Grouped variable importance
+
+rf_model_var_imp_df <-
+rf_model_var_imp_df %>% mutate(
+    group = ifelse(grepl('month',varname ), 'month',
+                   ifelse( grepl('dow',varname ), 'dow',varname))
+)
+
+rf_model_var_imp_grouped <- rf_model_var_imp_df %>%  group_by(group) %>% dplyr::summarise(group_imp_sum = sum(imp_percentage)) %>%  arrange(desc(group_imp_sum))
+
+
+# variable importance plot - top 10 only
+rf_model_var_imp_grouped_plot <-
+    ggplot(rf_model_var_imp_grouped, aes(x=reorder(group, group_imp_sum), y=group_imp_sum)) +
+    geom_point(color="navyblue", size=1) +
+    geom_segment(aes(x=group,xend=group,y=0,yend=group_imp_sum), color="navyblue", size=0.7) +
+    ylab("Importance (Percent)") +   xlab("Variable Name") +
+    coord_flip() +
+    # expand=c(0,0),
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=8), axis.text.y = element_text(size=8),
+          axis.title.x = element_text(size=8), axis.title.y = element_text(size=8))
+rf_model_var_imp_grouped_plot
+```
+
+## External validity
+
+I believe that external validity of the forecast of sales within the same region is high. In my point of view, behaviour of people going to the swimming pool is not something that changes abruptly over the years, unless some external factor plays a role, such as a global pandemic that forces these facilities to close - or the renovation of the building and increasing it's capacity which might attract more people to come and spend some time swimming in the pools. However I don't think that the model could be applied to any outdoor swimming pool in general since as we saw school schedule plays a massive role in the sales, and it might be specific to this region only. 
+
+## Conclusions
+
+My task was to carry out a 12 month forecast on ticket sales of outdoor swimming pools in Albuquerque. I used different machine learning models to carry out a time-series forecast using predictors such as day of the week, month, holidays and so on. It turns out that a random forest model can do a relatively good prediction beating simple OLS, Facebook's prophet and even XGBoost. Models were trained on a 5 year long time series and tested on the year 2016 which was the holdout. Ticket sales had high seasonality in the form of a massive increase in the summer time and higher average sales on the weekends. The random forest model used month, a categorical predictor and *school_off*  dummy as the most important predictor. I believe that this model can do pretty well on forecasting sales, has high external validity and could be essential for business planning.
